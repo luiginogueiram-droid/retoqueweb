@@ -1,0 +1,33 @@
+RETOQUE IA WEB - roda direto no celular, sem PC e sem enviar fotos
+
+COMO COLOCAR NO AR (grátis, uma vez só)
+Os arquivos precisam estar num endereço https. Opções gratuitas:
+  - Netlify Drop (app.netlify.com/drop): arraste esta pasta inteira e pronto.
+  - Cloudflare Pages ou GitHub Pages: envie esta pasta como site estático.
+  - Space "Static" do Hugging Face: crie um Space do tipo Static e envie os arquivos.
+Depois abra o endereço no celular.
+
+COMO INSTALAR NO CELULAR
+  - Android (Chrome): menu ⋮ > "Instalar app" / "Adicionar à tela inicial".
+  - iPhone (Safari): botão Compartilhar > "Adicionar à Tela de Início".
+Abra uma vez com internet e use o recurso de rosto e (se for usar) o de fundo
+pelo menos uma vez: depois disso ele funciona sem internet.
+
+SE ALGO DER ERRADO
+  Role até o fim da página, abra "Diagnóstico", toque em "Testar sistema" (com uma foto
+  já escolhida) e depois em "Copiar relatório". Mande o texto para quem for corrigir.
+
+ATUALIZANDO UMA VERSÃO JÁ PUBLICADA
+  Suba a pasta de novo no mesmo lugar. No celular, feche e abra o app duas vezes
+  (a primeira baixa a versão nova, a segunda passa a usá-la).
+
+TESTAR NO PC ANTES (opcional)
+  Dentro desta pasta:  python -m http.server 8000
+  Abra http://localhost:8000
+  (não funciona abrindo o index.html com duplo clique)
+
+ESTRUTURA
+  index.html, app.js   -> tela
+  engine.js, worker.js -> retoque (pele, dentes, olhos, liquify, fundo)
+  sw.js, manifest      -> modo offline e instalação
+  lib/                 -> modelos do MediaPipe (rosto e fundo), já incluídos
