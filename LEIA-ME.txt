@@ -13,6 +13,25 @@ COMO INSTALAR NO CELULAR
 Abra uma vez com internet e use o recurso de rosto e (se for usar) o de fundo
 pelo menos uma vez: depois disso ele funciona sem internet.
 
+COMO USAR OS RECURSOS
+  - Comparar: toque em "Comparar" e arraste o dedo sobre a foto (antes à esquerda, depois à direita).
+  - Pincéis (botões abaixo da foto): Manchas (toque em cada espinha), Clarear e Escurecer
+    (passe o dedo), Empurrar (liquify manual). "Desfazer" tira o último. Tamanho e força em "Pincéis".
+  - Presets: aplique um pronto (inclui "Produto (e-commerce)") ou salve o seu com "Salvar atual" (★).
+  - Ajuste automático: em "Luz e cor". Sugere exposição e contraste pelo histograma.
+  - Igualar cor da sessão: em "Igualar cor da sessão", escolha uma foto de referência; as outras
+    se aproximam da cor dela. A referência fica guardada no aparelho.
+  - Pele: "Uniformizar manchas de tom", "Reduzir brilho oleoso" e "Reduzir olheiras".
+  - Fundo: Pessoa ou Produto (fundo liso). Opções: transparente, cor, desfocado, sombra suave.
+    Contorno claro no recorte: aumente "Limpar borda do recorte". "Refino de cabelo" é experimental.
+  - Foto de grupo: ative em "Detecção" para achar rostos pequenos (mais lento).
+  - Marca d'água: texto ou logo (canto, centro ou repetido).
+  - Saída: "12 MP" e "24 MP" usam a foto quase original (24 MP pode travar o celular).
+    Formato para redes (4:5, 9:16, 1:1, 16:9) recorta centrando nos rostos.
+    EXIF e perfil de cor da câmera são copiados para o JPEG final (inclui localização, se a foto tiver;
+    desligue em "Saída" para remover).
+  - Lote: escolha várias fotos, "Processar todas", depois "Salvar todas" ou "Salvar ZIP".
+
 SE ALGO DER ERRADO
   Role até o fim da página, abra "Diagnóstico", toque em "Testar sistema" (com uma foto
   já escolhida) e depois em "Copiar relatório". Mande o texto para quem for corrigir.
@@ -28,6 +47,7 @@ TESTAR NO PC ANTES (opcional)
 
 ESTRUTURA
   index.html, app.js   -> tela
-  engine.js, worker.js -> retoque (pele, dentes, olhos, liquify, fundo)
+  engine.js, worker.js -> retoque (pele, dentes, olhos, liquify, fundo, produto, luz, cor)
+  meta.js              -> EXIF, perfil de cor e ZIP
   sw.js, manifest      -> modo offline e instalação
   lib/                 -> modelos do MediaPipe (rosto e fundo), já incluídos

@@ -343,9 +343,10 @@
   const scaleMask = (m, k) => { if (k === 1) return m; const o = new Float32Array(m.length); for (let i = 0; i < m.length; i++) o[i] = m[i] * k; return o; };
 
   // liquify: deformação local por landmarks. Retorna { data, alpha }
-  function liquify(img, faces, slim, eyesBig, nose, alpha) {
+  function liquify(img, faces, slim, eyesBig, nose, alpha, pushes) {
     const { data, w, h } = img;
-    if (Math.max(slim, eyesBig, nose) <= 0 || !faces.length) return { data, alpha };
+    const hasPush = !!(pushes && pushes.length), auto = Math.max(slim, eyesBig, nose) > 0 && faces.length > 0;
+    if (!auto && !hasPush) return { data, alpha };
     const s = Math.min(1, 900 / Math.max(w, h)), gw = Math.max(2, Math.floor(w * s)), gh = Math.max(2, Math.floor(h * s));
     const dx = new Float32Array(gw * gh), dy = new Float32Array(gw * gh);
     const win = (cx, cy, r) => [Math.max(0, Math.floor(cx - 3 * r)), Math.min(gw, Math.floor(cx + 3 * r) + 1), Math.max(0, Math.floor(cy - 3 * r)), Math.min(gh, Math.floor(cy + 3 * r) + 1)];
@@ -363,7 +364,7 @@
         dx[y * gw + x] -= (x - c[0]) * k * f; dy[y * gw + x] -= (y - c[1]) * k * f;
       }
     }
-    for (const lm of faces) {
+    if (auto) for (const lm of faces) {
       const fw = faceWidth(lm, gw, gh), top = P(lm, 10, gw, gh), chin = P(lm, 152, gw, gh), cx = (top[0] + chin[0]) / 2;
       if (slim > 0) {
         const mag = (slim / 100) * 0.07 * fw;
@@ -380,6 +381,10 @@
         const mag = (nose / 100) * 0.04 * fw;
         for (const [i, wt] of IDX.NOSE) { const p = P(lm, i, gw, gh); push(p, (cx > p[0] ? 1 : -1) * mag * wt, 0, 0.06 * fw); }
       }
+    }
+    if (hasPush) for (const op of pushes) {
+      const k = 0.4 + 0.6 * (op.s || 0.5), r = Math.max(2, op.r * gw);
+      for (const pt of op.pts) push([pt[0] * gw, pt[1] * gh], pt[2] * gw * k, pt[3] * gh * k, r);
     }
     // região afetada
     let x0 = w, y0 = h, x1 = -1, y1 = -1;
@@ -425,42 +430,440 @@
     const c = (hex || '#FFFFFF').replace('#', '');
     return c.length === 6 ? [parseInt(c.slice(0, 2), 16), parseInt(c.slice(2, 4), 16), parseInt(c.slice(4, 6), 16)] : [255, 255, 255];
   }
-  function applyBackground(img, alpha, mode, hex, blur) {
-    const { data, w, h } = img, n = w * h;
-    if (mode === 'Transparente') { for (let i = 0; i < n; i++) data[i * 4 + 3] = clamp(alpha[i] * 255, 0, 255); return true; }
-    let bg = null;
+  // amostragem bilinear de um plano de baixa resolução
+  function bil(p, lw, lh, fx, fy) {
+    fx = clamp(fx, 0, lw - 1); fy = clamp(fy, 0, lh - 1);
+    const x0 = Math.floor(fx), y0 = Math.floor(fy), x1 = Math.min(lw - 1, x0 + 1), y1 = Math.min(lh - 1, y0 + 1), tx = fx - x0, ty = fy - y0;
+    return (p[y0 * lw + x0] * (1 - tx) + p[y0 * lw + x1] * tx) * (1 - ty) + (p[y1 * lw + x0] * (1 - tx) + p[y1 * lw + x1] * tx) * ty;
+  }
+  // cor "de dentro" da pessoa, espalhada para as bordas (para tirar o halo do fundo antigo)
+  function decontamField(L, aLo) {
+    const { data: d, w, h } = L, n = w * h;
+    let edgeCount = 0;
+    for (let i = 0; i < n; i++) if (aLo[i] > 0.02 && aLo[i] < 0.97) edgeCount++;
+    if (!edgeCount) return null;
+    const core = new Float32Array(n);
+    for (let i = 0; i < n; i++) core[i] = aLo[i] >= 0.97 ? 1 : 0;
+    const sigma = Math.max(2, Math.max(w, h) / 500), gc = gauss(core, w, h, sigma), fc = [];
+    for (let c = 0; c < 3; c++) {
+      const p = new Float32Array(n);
+      for (let i = 0; i < n; i++) p[i] = d[i * 4 + c] * core[i];
+      const g = gauss(p, w, h, sigma);
+      for (let i = 0; i < n; i++) g[i] = g[i] / (gc[i] + 1e-4);
+      fc.push(g);
+    }
+    return { fc, gc };
+  }
+  function shadowPlane(aLo, lw, lh, strength) {
+    const off = Math.max(lw, lh), dx = Math.round(off * 0.012), dy = Math.round(off * 0.03), sh = new Float32Array(lw * lh);
+    for (let y = 0; y < lh; y++) for (let x = 0; x < lw; x++) { const sx = x - dx, sy = y - dy; if (sx >= 0 && sy >= 0 && sx < lw && sy < lh) sh[y * lw + x] = aLo[sy * lw + sx]; }
+    const g = gauss(sh, lw, lh, Math.max(2, off * 0.018)), k = (strength / 100) * 0.55;
+    for (let i = 0; i < g.length; i++) g[i] *= k;
+    return g;
+  }
+  // aux (opcional): { work, alphaWork } = versão em baixa resolução da foto (usada na resolução total)
+  function composeBackground(img, alpha, o, aux) {
+    const { data: d, w, h } = img, mode = o.bg, edge = o.edge;
+    const L = aux ? aux.work : img, lw = L.w, lh = L.h;
+    const aF = edge > 0 ? chokeAlpha(alpha, edge) : alpha;
+    const aLo = aux ? (edge > 0 ? chokeAlpha(aux.alphaWork, edge) : aux.alphaWork) : aF;
+    const field = edge > 0 ? decontamField(L, aLo) : null;
+    let bgPlanes = null, bgCol = null, shadow = null;
     if (mode === 'Desfocar') {
-      const sigma = (Math.max(w, h) * Math.max(blur, 1)) / 2500;
-      bg = [0, 1, 2].map((c) => { const p = new Float32Array(n); for (let i = 0; i < n; i++) p[i] = data[i * 4 + c]; return gauss(p, w, h, sigma); });
+      const sigma = (Math.max(lw, lh) * Math.max(o.bgBlur, 1)) / 2500;
+      bgPlanes = [0, 1, 2].map((c) => { const p = new Float32Array(lw * lh); for (let i = 0; i < p.length; i++) p[i] = L.data[i * 4 + c]; return gauss(p, lw, lh, sigma); });
+    } else if (mode === 'Cor sólida' || mode === 'Sombra suave') {
+      bgCol = hexToRgb(o.bgColor);
+      if (mode === 'Sombra suave' && o.shadow > 0) shadow = shadowPlane(aLo, lw, lh, o.shadow);
     }
-    const col = hexToRgb(hex);
-    for (let i = 0; i < n; i++) {
-      const a = alpha[i];
-      for (let c = 0; c < 3; c++) data[i * 4 + c] = data[i * 4 + c] * a + (bg ? bg[c][i] : col[c]) * (1 - a);
+    const sx = lw / w, sy = lh / h, transparent = mode === 'Transparente', same = lw === w && lh === h;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x, a = aF[i], i4 = i * 4;
+      const fx = same ? x : (x + 0.5) * sx - 0.5, fy = same ? y : (y + 0.5) * sy - 0.5;
+      if (field && a < 0.97) {
+        const g = bil(field.gc, lw, lh, fx, fy);
+        if (g >= 0.02) {
+          const mix = a < 0.5 ? 1 : clamp((0.97 - a) / 0.47, 0, 1);
+          for (let c = 0; c < 3; c++) d[i4 + c] = d[i4 + c] * (1 - mix) + bil(field.fc[c], lw, lh, fx, fy) * mix;
+        }
+      }
+      if (transparent) { d[i4 + 3] = clamp(a * 255, 0, 255); continue; }
+      if (a >= 0.999) continue;
+      const sh = shadow ? 1 - bil(shadow, lw, lh, fx, fy) : 1;
+      for (let c = 0; c < 3; c++) {
+        const b = (bgPlanes ? bil(bgPlanes[c], lw, lh, fx, fy) : bgCol[c]) * sh;
+        d[i4 + c] = d[i4 + c] * a + b * (1 - a);
+      }
     }
-    return false;
+    return transparent;
+  }
+
+  // ---------------------------------------------------------------- remover manchas (cura por toque)
+  // Copia textura limpa de uma área vizinha, ajustando a cor ao redor da mancha.
+  function healSpots(img, spots) {
+    if (!spots || !spots.length) return;
+    const { data: d, w, h } = img;
+    const px = (x, y, c) => d[(clamp(Math.round(y), 0, h - 1) * w + clamp(Math.round(x), 0, w - 1)) * 4 + c];
+    const ring = (x, y, rr) => {
+      const n = 16, m = [0, 0, 0], ys = [];
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * 2 * Math.PI, sx = x + Math.cos(a) * rr, sy = y + Math.sin(a) * rr;
+        const r = px(sx, sy, 0), g = px(sx, sy, 1), b = px(sx, sy, 2);
+        m[0] += r; m[1] += g; m[2] += b; ys.push(0.299 * r + 0.587 * g + 0.114 * b);
+      }
+      m[0] /= n; m[1] /= n; m[2] /= n;
+      const my = ys.reduce((a, v) => a + v, 0) / n, vr = ys.reduce((a, v) => a + (v - my) * (v - my), 0) / n;
+      return { m, vr };
+    };
+    for (const s of spots) {
+      const cx = s.x * w, cy = s.y * h, r = Math.max(3, s.r * w), tgt = ring(cx, cy, r * 1.5);
+      let best = null, bs = Infinity;
+      for (const dist of [2.6, 3.6]) for (let k = 0; k < 12; k++) {
+        const a = (k / 12) * 2 * Math.PI, sx = cx + Math.cos(a) * r * dist, sy = cy + Math.sin(a) * r * dist;
+        if (sx - 1.6 * r < 0 || sy - 1.6 * r < 0 || sx + 1.6 * r >= w || sy + 1.6 * r >= h) continue;
+        const sr = ring(sx, sy, r * 1.5), dm = Math.hypot(sr.m[0] - tgt.m[0], sr.m[1] - tgt.m[1], sr.m[2] - tgt.m[2]);
+        const cc = [px(sx, sy, 0), px(sx, sy, 1), px(sx, sy, 2)], dc = Math.hypot(cc[0] - tgt.m[0], cc[1] - tgt.m[1], cc[2] - tgt.m[2]);
+        const sc = dm + 0.8 * Math.sqrt(sr.vr) + 0.6 * dc;
+        if (sc < bs) { bs = sc; best = { sx, sy, sr }; }
+      }
+      if (!best) continue;
+      const ox = best.sx - cx, oy = best.sy - cy, shift = [0, 1, 2].map((c) => tgt.m[c] - best.sr.m[c]);
+      const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(w - 1, Math.ceil(cx + r)), y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(h - 1, Math.ceil(cy + r));
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+        const dd = Math.hypot(x - cx, y - cy) / r;
+        if (dd >= 1) continue;
+        const t = smoothstep((1 - dd) / 0.4), o = (y * w + x) * 4;
+        for (let c = 0; c < 3; c++) d[o + c] = d[o + c] * (1 - t) + clamp(px(x + ox, y + oy, c) + shift[c], 0, 255) * t;
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- luz, cor e nitidez
+  function tone(img, exposure, contrast, warmth) {
+    if (!exposure && !contrast && !warmth) return;
+    const gain = Math.pow(2, exposure / 100), k = (contrast / 100) * 0.6;
+    const luts = [0, 1, 2].map((c) => {
+      const lut = new Uint8ClampedArray(256), mult = c === 0 ? 1 + (warmth / 100) * 0.1 : c === 2 ? 1 - (warmth / 100) * 0.1 : 1;
+      for (let i = 0; i < 256; i++) {
+        let v = Math.pow(i / 255, 2.2) * gain;
+        v = Math.pow(clamp(v, 0, 1), 1 / 2.2);
+        v = clamp(0.5 + (v - 0.5) * (1 + k), 0, 1);
+        lut[i] = Math.round(clamp(v * mult, 0, 1) * 255);
+      }
+      return lut;
+    });
+    const d = img.data;
+    for (let i = 0; i < d.length; i += 4) { d[i] = luts[0][d[i]]; d[i + 1] = luts[1][d[i + 1]]; d[i + 2] = luts[2][d[i + 2]]; }
+  }
+  function sharpenImg(img, amount) {
+    if (amount <= 0) return;
+    const { data: d, w, h } = img, sigma = Math.max(0.7, Math.max(w, h) / 2000), m = Math.ceil(sigma * 6) + 2, a = (amount / 100) * 1.2, strip = 256;
+    for (let y0 = 0; y0 < h; y0 += strip) {
+      const y1 = Math.min(h, y0 + strip), ya = Math.max(0, y0 - m), yb = Math.min(h, y1 + m), sh = yb - ya, Y = new Float32Array(w * sh);
+      for (let y = 0; y < sh; y++) for (let x = 0; x < w; x++) { const i = ((ya + y) * w + x) * 4; Y[y * w + x] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]; }
+      const bl = gauss(Y, w, sh, sigma);
+      for (let y = y0; y < y1; y++) for (let x = 0; x < w; x++) {
+        const k = (y - ya) * w + x, dl = clamp((Y[k] - bl[k]) * a, -40, 40), i = (y * w + x) * 4;
+        d[i] += dl; d[i + 1] += dl; d[i + 2] += dl;
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- borda do recorte (tira o "halo")
+  function chokeAlpha(alpha, edge) {
+    const lo = clamp((edge / 100) * 0.3, 0, 0.45), span = 1 - 2 * lo, out = new Float32Array(alpha.length);
+    for (let i = 0; i < alpha.length; i++) out[i] = smoothstep((alpha[i] - lo) / span);
+    return out;
+  }
+  // nas bordas semitransparentes, troca a cor contaminada pelo fundo antigo pela cor de dentro da pessoa
+  function decontaminate(img, alpha) {
+    const { data: d, w, h } = img, n = w * h;
+    let edgeCount = 0;
+    for (let i = 0; i < n; i++) if (alpha[i] > 0.02 && alpha[i] < 0.97) edgeCount++;
+    if (!edgeCount) return;
+    const core = new Float32Array(n);
+    for (let i = 0; i < n; i++) core[i] = alpha[i] >= 0.97 ? 1 : 0;
+    const sigma = Math.max(2, Math.max(w, h) / 500), gc = gauss(core, w, h, sigma);
+    for (let c = 0; c < 3; c++) {
+      const p = new Float32Array(n);
+      for (let i = 0; i < n; i++) p[i] = d[i * 4 + c] * core[i];
+      const gp = gauss(p, w, h, sigma);
+      for (let i = 0; i < n; i++) {
+        const a = alpha[i];
+        if (a >= 0.97 || gc[i] < 0.02) continue;
+        const mix = a < 0.5 ? 1 : clamp((0.97 - a) / 0.47, 0, 1);
+        d[i * 4 + c] = d[i * 4 + c] * (1 - mix) + (gp[i] / gc[i]) * mix;
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- foto de grupo (blocos + junção de rostos)
+  function tileRects(w, h) {
+    const tw = Math.round(w * 0.6), th = Math.round(h * 0.6);
+    return [[0, 0], [w - tw, 0], [0, h - th], [w - tw, h - th]].map(([x, y]) => ({ x, y, w: tw, h: th }));
+  }
+  function faceBox(f) {
+    let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+    for (const p of f) {
+      const x = p.x !== undefined ? p.x : p[0], y = p.y !== undefined ? p.y : p[1];
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+    return { x0, y0, x1, y1 };
+  }
+  function mergeFaces(list) {
+    const items = list.map((f) => { const b = faceBox(f); return { f, b, a: (b.x1 - b.x0) * (b.y1 - b.y0) }; }).sort((u, v) => v.a - u.a), kept = [];
+    for (const o of items) {
+      const cx = (o.b.x0 + o.b.x1) / 2, cy = (o.b.y0 + o.b.y1) / 2, wd = o.b.x1 - o.b.x0;
+      const dup = kept.some((k) => Math.hypot(cx - (k.b.x0 + k.b.x1) / 2, cy - (k.b.y0 + k.b.y1) / 2) < 0.45 * Math.max(wd, k.b.x1 - k.b.x0));
+      if (!dup) kept.push(o);
+    }
+    return kept.map((o) => o.f);
   }
 
   // ---------------------------------------------------------------- pipeline
-  const DEFAULTS = { smooth: 50, texture: 70, body: false, teeth: 40, eyes: 30, slim: 0, eyesBig: 0, nose: 0, bg: 'Manter', bgColor: '#FFFFFF', bgBlur: 35 };
+  // ---------------------------------------------------------------- igualar cor entre fotos (Reinhard em Lab)
+  function labStats(img, step) {
+    const { data: d, w, h } = img, lab = [0, 0, 0], sum = [0, 0, 0], sq = [0, 0, 0];
+    step = Math.max(1, step || Math.round(Math.max(w, h) / 256));
+    let n = 0;
+    for (let y = 0; y < h; y += step) for (let x = 0; x < w; x += step) {
+      const i = (y * w + x) * 4; rgb2lab(d[i], d[i + 1], d[i + 2], lab);
+      for (let c = 0; c < 3; c++) { sum[c] += lab[c]; sq[c] += lab[c] * lab[c]; } n++;
+    }
+    const mean = sum.map((v) => v / n), std = sq.map((v, c) => Math.sqrt(Math.max(1e-6, v / n - mean[c] * mean[c])));
+    return { mean, std };
+  }
+  function colorMatch(img, ref, strength) {
+    const cur = labStats(img), k = clamp(strength / 100, 0, 1), { data: d, w, h } = img, lab = [0, 0, 0], rgb = [0, 0, 0];
+    const ratio = [0, 1, 2].map((c) => clamp(ref.std[c] / cur.std[c], 0.75, 1.33));
+    for (let i = 0; i < w * h; i++) {
+      rgb2lab(d[i * 4], d[i * 4 + 1], d[i * 4 + 2], lab);
+      const o = [0, 1, 2].map((c) => { const t = ref.mean[c] + (lab[c] - cur.mean[c]) * ratio[c]; return lab[c] + (t - lab[c]) * k; });
+      lab2rgb(o[0], o[1], o[2], rgb); d[i * 4] = rgb[0]; d[i * 4 + 1] = rgb[1]; d[i * 4 + 2] = rgb[2];
+    }
+  }
+  // sugestão de exposição/contraste olhando o histograma (não depende do tom de pele)
+  function autoTone(img) {
+    const { data: d, w, h } = img, hist = new Uint32Array(256), step = Math.max(1, Math.round(Math.max(w, h) / 400));
+    let n = 0;
+    for (let y = 0; y < h; y += step) for (let x = 0; x < w; x += step) { const i = (y * w + x) * 4; hist[Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2])]++; n++; }
+    const pct = (p) => { let acc = 0; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= p * n) return v; } return 255; };
+    const p99 = pct(0.99), p1 = pct(0.01);
+    let clipped = 0; for (let v = 250; v < 256; v++) clipped += hist[v];
+    let exposure = 0, contrast = 0;
+    if (p99 < 225) exposure = Math.min(0.7, Math.log2(0.93 / Math.pow(Math.max(p99, 20) / 255, 2.2))) * 100;
+    else if (clipped / n > 0.02) exposure = -Math.min(0.5, (clipped / n) * 10) * 100;
+    const range = (p99 - p1) / 255;
+    if (range < 0.75) contrast = Math.min(25, (0.75 - range) * 60);
+    return { exposure: Math.round(exposure), contrast: Math.round(contrast) };
+  }
 
-  // img: {data: Uint8ClampedArray RGBA, w, h}; faces: landmarks por rosto; person: Float32Array(w*h) ou null
+  // ---------------------------------------------------------------- acabamento fino da pele
+  function skinFinish(img, mask, faces, shine, even) {
+    const { data, w, h } = img;
+    let x0 = w, y0 = h, x1 = -1, y1 = -1;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (mask[y * w + x] > 0.01) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+    if (x1 < 0) return;
+    const fw = Math.max(...faces.map((lm) => faceWidth(lm, w, h))), pad = Math.ceil(fw / 6);
+    const b = { x0: Math.max(0, x0 - pad), y0: Math.max(0, y0 - pad), x1: Math.min(w, x1 + pad + 1), y1: Math.min(h, y1 + pad + 1) };
+    const cw = b.x1 - b.x0, ch = b.y1 - b.y0, n = cw * ch, Lp = new Float32Array(n), Ap = new Float32Array(n), Bp = new Float32Array(n), lab = [0, 0, 0];
+    for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) { const i = ((b.y0 + y) * w + b.x0 + x) * 4; rgb2lab(data[i], data[i + 1], data[i + 2], lab); Lp[y * cw + x] = lab[0]; Ap[y * cw + x] = lab[1]; Bp[y * cw + x] = lab[2]; }
+    const ke = (even / 100) * 0.8, ks = (shine / 100) * 0.9;
+    const Ab = ke > 0 ? gauss(Ap, cw, ch, Math.max(2, fw / 25)) : null, Bb = ke > 0 ? gauss(Bp, cw, ch, Math.max(2, fw / 25)) : null, Lb = ks > 0 ? gauss(Lp, cw, ch, Math.max(2, fw / 14)) : null, rgb = [0, 0, 0];
+    for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+      const k = y * cw + x, m = mask[(b.y0 + y) * w + b.x0 + x];
+      if (m < 0.01) continue;
+      let L = Lp[k], A = Ap[k], B = Bp[k];
+      if (Ab) { A += (Ab[k] - A) * ke * m; B += (Bb[k] - B) * ke * m; }
+      if (Lb) { const ex = Math.max(0, L - Lb[k] - 2); L -= ex * ks * m; }
+      lab2rgb(L, A, B, rgb); const i = ((b.y0 + y) * w + b.x0 + x) * 4; data[i] = rgb[0]; data[i + 1] = rgb[1]; data[i + 2] = rgb[2];
+    }
+  }
+  const EYE_L_LOW = [263, 249, 390, 373, 374, 380, 381, 382, 362], EYE_R_LOW = [33, 7, 163, 144, 145, 153, 154, 155, 133];
+  function underEye(img, faces, amount) {
+    const { w, h } = img, total = new Float32Array(w * h);
+    for (const lm of faces) for (const [low, eye] of [[EYE_L_LOW, IDX.EYE_L], [EYE_R_LOW, IDX.EYE_R]]) {
+      const lo = pts(lm, low, w, h), eh = hull(pts(lm, eye, w, h)), bb = bbox(eh, w, h, 0), ew = bb.x1 - bb.x0, shift = 0.34 * ew;
+      const poly = lo.concat(lo.slice().reverse().map((p) => [p[0], p[1] + shift]));
+      const m = new Float32Array(w * h);
+      fillPoly(m, w, h, poly, 1); fillPoly(m, w, h, eh, 0);
+      const box = bbox(poly, w, h, 0); gaussRegion(m, w, h, box, Math.max(1, ew / 6));
+      for (let y = box.y0; y < box.y1; y++) for (let x = box.x0; x < box.x1; x++) { const i = y * w + x; if (m[i] > total[i]) total[i] = m[i]; }
+    }
+    applyLab(img, total, (amount / 100) * 6, 0);
+  }
+
+  // ---------------------------------------------------------------- pincel de luz e sombra
+  function dodgeBurn(img, strokes) {
+    if (!strokes || !strokes.length) return;
+    const { data: d, w, h } = img;
+    for (const st of strokes) {
+      const sign = st.t === 'dodge' ? 1 : -1, rad = Math.max(3, st.r * w), str = (0.3 + 0.7 * (st.s || 0.5)) * 0.14;
+      for (const pt of st.pts) {
+        const cx = pt[0] * w, cy = pt[1] * h, x0 = Math.max(0, Math.floor(cx - rad)), x1 = Math.min(w - 1, Math.ceil(cx + rad)), y0 = Math.max(0, Math.floor(cy - rad)), y1 = Math.min(h - 1, Math.ceil(cy + rad));
+        for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+          const dd = Math.hypot(x - cx, y - cy) / rad;
+          if (dd >= 1) continue;
+          const f = 1 + sign * str * smoothstep(1 - dd), i = (y * w + x) * 4;
+          d[i] *= f; d[i + 1] *= f; d[i + 2] *= f;
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- recorte de produto (fundo liso)
+  function productAlpha(img) {
+    const { data: d, w, h } = img, s = Math.min(1, 512 / Math.max(w, h)), gw = Math.max(4, Math.round(w * s)), gh = Math.max(4, Math.round(h * s)), n = gw * gh;
+    const lab = new Float32Array(n * 3), t = [0, 0, 0];
+    for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+      const i = (Math.min(h - 1, Math.floor(y / s)) * w + Math.min(w - 1, Math.floor(x / s))) * 4; rgb2lab(d[i], d[i + 1], d[i + 2], t);
+      lab.set(t, (y * gw + x) * 3);
+    }
+    const border = [];
+    for (let x = 0; x < gw; x++) { border.push(x, (gh - 1) * gw + x); }
+    for (let y = 0; y < gh; y++) { border.push(y * gw, y * gw + gw - 1); }
+    const med = (c) => { const v = border.map((i) => lab[i * 3 + c]).sort((p, q) => p - q); return v[v.length >> 1]; };
+    const bg = [med(0), med(1), med(2)], dist = new Float32Array(n);
+    for (let i = 0; i < n; i++) dist[i] = Math.hypot(lab[i * 3] - bg[0], lab[i * 3 + 1] - bg[1], lab[i * 3 + 2] - bg[2]);
+    const bd = border.map((i) => dist[i]).sort((p, q) => p - q), t0 = Math.max(5, bd[Math.floor(bd.length * 0.95)] * 1.5);
+    const bgc = new Uint8Array(n), queue = new Int32Array(n);
+    let qh = 0, qt = 0;
+    for (const i of border) if (dist[i] < t0 && !bgc[i]) { bgc[i] = 1; queue[qt++] = i; }
+    while (qh < qt) {
+      const i = queue[qh++], x = i % gw, y = (i / gw) | 0;
+      if (x > 0 && !bgc[i - 1] && dist[i - 1] < t0) { bgc[i - 1] = 1; queue[qt++] = i - 1; }
+      if (x < gw - 1 && !bgc[i + 1] && dist[i + 1] < t0) { bgc[i + 1] = 1; queue[qt++] = i + 1; }
+      if (y > 0 && !bgc[i - gw] && dist[i - gw] < t0) { bgc[i - gw] = 1; queue[qt++] = i - gw; }
+      if (y < gh - 1 && !bgc[i + gw] && dist[i + gw] < t0) { bgc[i + gw] = 1; queue[qt++] = i + gw; }
+    }
+    const low = new Float32Array(n);
+    for (let i = 0; i < n; i++) low[i] = bgc[i] ? smoothstep((dist[i] - 0.6 * t0) / (0.4 * t0)) : 1;
+    return refineAlpha(resizeBilinear(low, gw, gh, w, h), img);
+  }
+  // segundo passe, mais fino, só na faixa de transição (fios de cabelo)
+  function refineAlphaFine(alpha, img) {
+    const { data, w, h } = img, n = w * h, I = new Float32Array(n), II = new Float32Array(n), p = new Float32Array(n);
+    for (let i = 0; i < n; i++) { I[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2]; II[i] = I[i] * I[i]; p[i] = alpha[i] * 255; }
+    const r = Math.max(2, Math.round(Math.max(w, h) / 700)), q = guided(p, I, boxBlur(I, w, h, r), boxBlur(II, w, h, r), w, h, r, Math.pow(0.015 * 255, 2)), out = new Float32Array(n);
+    for (let i = 0; i < n; i++) { const a = alpha[i], wt = 1 - Math.pow(Math.abs(2 * a - 1), 4); out[i] = clamp(a * (1 - wt) + clamp(q[i] / 255, 0, 1) * wt, 0, 1); }
+    return out;
+  }
+
+  // ---------------------------------------------------------------- recorte (formato de redes sociais)
+  function cropRect(w, h, aspect, fx, fy) {
+    let cw = w, ch = h;
+    if (w / h > aspect) cw = Math.round(h * aspect); else ch = Math.round(w / aspect);
+    const x = clamp(Math.round((fx === undefined ? 0.5 : fx) * w - cw / 2), 0, w - cw), y = clamp(Math.round((fy === undefined ? 0.5 : fy) * h - ch / 2), 0, h - ch);
+    return { x, y, w: cw, h: ch };
+  }
+
+  // ---------------------------------------------------------------- pipeline
+  const DEFAULTS = { smooth: 50, texture: 70, body: false, even: 0, shine: 0, teeth: 40, eyes: 30, undereye: 0, slim: 0, eyesBig: 0, nose: 0, exposure: 0, contrast: 0, warmth: 0, sharpen: 0,
+    matchStrength: 60, ref: null, cutout: 'Pessoa', hair: false, bg: 'Manter', bgColor: '#FFFFFF', bgBlur: 35, shadow: 40, edge: 30, ops: [] };
+  const HI_PIXELS = 4.5e6, WORK_MAX = 2048;
+
+  // passos que são "suaves" (podem ser feitos em tamanho reduzido e transferidos como diferença)
+  function core(work, faces, alpha, o) {
+    const ops = o.ops || [];
+    if (o.ref && o.matchStrength > 0) colorMatch(work, o.ref, o.matchStrength);
+    if (faces.length) {
+      const base = { data: new Uint8ClampedArray(work.data), w: work.w, h: work.h };
+      const sm = skinMask(base, faces, o.body, alpha);
+      smoothSkin(work, sm, faces, o.smooth, o.texture);
+      if (o.even > 0 || o.shine > 0) skinFinish(work, sm, faces, o.shine, o.even);
+      if (o.teeth > 0) applyLab(work, teethMask(base, faces), (o.teeth / 100) * 5.5, (o.teeth / 100) * 0.7);
+      if (o.eyes > 0) applyLab(work, eyeMask(base, faces), (o.eyes / 100) * 3.9, (o.eyes / 100) * 0.4);
+      if (o.undereye > 0) underEye(work, faces, o.undereye);
+    }
+    dodgeBurn(work, ops.filter((p) => p.t === 'dodge' || p.t === 'burn'));
+  }
+  const spotsOf = (o) => (o.ops || []).filter((p) => p.t === 'spot'), pushesOf = (o) => (o.ops || []).filter((p) => p.t === 'push');
+
   function retouch(img, faces, person, opts) {
     const o = Object.assign({}, DEFAULTS, opts), w = img.w, h = img.h;
     let out = { data: new Uint8ClampedArray(img.data), w, h }, alpha = person || null;
-    if (faces.length) {
-      const sm = skinMask(img, faces, o.body, alpha);
-      smoothSkin(out, sm, faces, o.smooth, o.texture);
-      if (o.teeth > 0) applyLab(out, scaleMask(teethMask(img, faces), 1), (o.teeth / 100) * 5.5, (o.teeth / 100) * 0.7);
-      if (o.eyes > 0) applyLab(out, eyeMask(img, faces), (o.eyes / 100) * 3.9, (o.eyes / 100) * 0.4);
-      const l = liquify(out, faces, o.slim, o.eyesBig, o.nose, alpha);
-      out = { data: l.data, w, h }; alpha = l.alpha;
-    }
+    healSpots(out, spotsOf(o));
+    core(out, faces, alpha, o);
+    const l = liquify(out, faces, o.slim, o.eyesBig, o.nose, alpha, pushesOf(o));
+    out = { data: l.data, w, h }; alpha = l.alpha;
+    tone(out, o.exposure, o.contrast, o.warmth);
+    sharpenImg(out, o.sharpen);
     let hasAlpha = false;
-    if (o.bg !== 'Manter' && alpha) hasAlpha = applyBackground(out, alpha, o.bg, o.bgColor, o.bgBlur);
+    if (o.bg !== 'Manter' && alpha) hasAlpha = composeBackground(out, alpha, o, null);
     return { img: out, hasAlpha, faceCount: faces.length };
   }
 
-  const E = { IDX, DEFAULTS, retouch, skinMask, smoothSkin, liquify, refineAlpha, resizeBilinear, gauss, boxBlur };
+  // área média (caixa) + bilinear: reduz a foto grande para o tamanho de trabalho
+  function downscale(img, tw, th) {
+    let { data, w, h } = img;
+    const k = Math.max(1, Math.floor(Math.min(w / tw, h / th)));
+    if (k > 1) {
+      const sw = Math.floor(w / k), sh = Math.floor(h / k), out = new Uint8ClampedArray(sw * sh * 4), inv = 1 / (k * k);
+      for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) for (let c = 0; c < 4; c++) {
+        let acc = 0; for (let j = 0; j < k; j++) for (let i = 0; i < k; i++) acc += data[((y * k + j) * w + x * k + i) * 4 + c];
+        out[(y * sw + x) * 4 + c] = acc * inv;
+      }
+      data = out; w = sw; h = sh;
+    }
+    const out = new Uint8ClampedArray(tw * th * 4);
+    for (let y = 0; y < th; y++) {
+      const fy = clamp((y + 0.5) * (h / th) - 0.5, 0, h - 1), y0 = Math.floor(fy), y1 = Math.min(h - 1, y0 + 1), ty = fy - y0;
+      for (let x = 0; x < tw; x++) {
+        const fx = clamp((x + 0.5) * (w / tw) - 0.5, 0, w - 1), x0 = Math.floor(fx), x1 = Math.min(w - 1, x0 + 1), tx = fx - x0;
+        for (let c = 0; c < 4; c++) {
+          const a = data[(y0 * w + x0) * 4 + c] * (1 - tx) + data[(y0 * w + x1) * 4 + c] * tx, b = data[(y1 * w + x0) * 4 + c] * (1 - tx) + data[(y1 * w + x1) * 4 + c] * tx;
+          out[(y * tw + x) * 4 + c] = a * (1 - ty) + b * ty;
+        }
+      }
+    }
+    return { data: out, w: tw, h: th };
+  }
+  // soma, na foto grande, a diferença (editada - original) calculada em tamanho reduzido
+  function addUpsampledDiff(img, edited, orig, ww, wh) {
+    const { data: d, w, h } = img, diff = new Int16Array(ww * wh * 3);
+    for (let i = 0; i < ww * wh; i++) for (let c = 0; c < 3; c++) diff[i * 3 + c] = edited[i * 4 + c] - orig[i * 4 + c];
+    const sx = ww / w, sy = wh / h, xi0 = new Int32Array(w), xi1 = new Int32Array(w), xt = new Float32Array(w);
+    for (let x = 0; x < w; x++) { const fx = clamp((x + 0.5) * sx - 0.5, 0, ww - 1); xi0[x] = Math.floor(fx); xi1[x] = Math.min(ww - 1, xi0[x] + 1); xt[x] = fx - xi0[x]; }
+    for (let y = 0; y < h; y++) {
+      const fy = clamp((y + 0.5) * sy - 0.5, 0, wh - 1), y0 = Math.floor(fy), y1 = Math.min(wh - 1, y0 + 1), ty = fy - y0;
+      for (let x = 0; x < w; x++) {
+        const t = xt[x], i = (y * w + x) * 4;
+        for (let c = 0; c < 3; c++) {
+          const a = diff[(y0 * ww + xi0[x]) * 3 + c] * (1 - t) + diff[(y0 * ww + xi1[x]) * 3 + c] * t, b = diff[(y1 * ww + xi0[x]) * 3 + c] * (1 - t) + diff[(y1 * ww + xi1[x]) * 3 + c] * t;
+          d[i + c] += a * (1 - ty) + b * ty;
+        }
+      }
+    }
+  }
+  function alphaFrom(o, seg, img, faceless) {
+    if (o.cutout === 'Produto') return o.bg !== 'Manter' ? productAlpha(img) : null;
+    if (!seg) return null;
+    const a = refineAlpha(resizeBilinear(seg.data, seg.w, seg.h, img.w, img.h), img);
+    return o.hair ? refineAlphaFine(a, img) : a;
+  }
+  // foto grande: edita em tamanho de trabalho e transfere; geometria, luz, nitidez e fundo na foto grande
+  function retouchHi(img, faces, seg, o) {
+    const w = img.w, h = img.h, s = Math.min(1, WORK_MAX / Math.max(w, h)), ww = Math.round(w * s), wh = Math.round(h * s);
+    healSpots(img, spotsOf(o));
+    const work = downscale(img, ww, wh), orig = new Uint8ClampedArray(work.data), aw = alphaFrom(o, seg, work);
+    core(work, faces, aw, o);
+    addUpsampledDiff(img, work.data, orig, ww, wh);
+    let alpha = aw ? resizeBilinear(aw, ww, wh, w, h) : null;
+    const l = liquify(img, faces, o.slim, o.eyesBig, o.nose, alpha, pushesOf(o));
+    const out = { data: l.data, w, h }; alpha = l.alpha;
+    tone(out, o.exposure, o.contrast, o.warmth);
+    sharpenImg(out, o.sharpen);
+    let hasAlpha = false;
+    if (o.bg !== 'Manter' && alpha) hasAlpha = composeBackground(out, alpha, o, { work, alphaWork: aw });
+    return { img: out, hasAlpha, faceCount: faces.length };
+  }
+  // ponto de entrada: escolhe sozinho entre o caminho normal e o de foto grande
+  function processImage(img, faces, seg, opts) {
+    const o = Object.assign({}, DEFAULTS, opts);
+    if (img.w * img.h > HI_PIXELS) return retouchHi(img, faces, seg, o);
+    return retouch(img, faces, alphaFrom(o, seg, img), o);
+  }
+
+  const E = { IDX, DEFAULTS, processImage, retouchHi, labStats, colorMatch, autoTone, skinFinish, underEye, dodgeBurn, productAlpha, refineAlphaFine, cropRect, downscale, composeBackground, faceBox, retouch, skinMask, smoothSkin, liquify, refineAlpha, resizeBilinear, gauss, boxBlur, healSpots, tone, sharpenImg, chokeAlpha, decontaminate, tileRects, mergeFaces };
   if (typeof module !== 'undefined' && module.exports) module.exports = E; else root.RetoqueEngine = E;
 })(typeof self !== 'undefined' ? self : globalThis);

@@ -6,9 +6,7 @@ onmessage = (e) => {
   if (ping) return postMessage({ id, ok: true, ping: true, engine: !!E });
   try {
     const img = { data: new Uint8ClampedArray(buffer), w, h };
-    let person = null;
-    if (seg) person = E.refineAlpha(E.resizeBilinear(seg.data, seg.w, seg.h, w, h), img);
-    const r = E.retouch(img, faces, person, opts);
+    const r = E.processImage(img, faces, seg, opts);
     postMessage({ id, ok: true, w, h, buffer: r.img.data.buffer, hasAlpha: r.hasAlpha, faceCount: r.faceCount }, [r.img.data.buffer]);
   } catch (err) {
     postMessage({ id, ok: false, error: String((err && err.message) || err) });

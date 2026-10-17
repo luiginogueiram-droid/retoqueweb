@@ -32,6 +32,11 @@
   .row input[type=range] { width:100%; accent-color: var(--gold); margin-top:6px; }
   .row select, .row input[type=color] { width:100%; margin-top:6px; padding:10px; background:#101013; color:var(--text); border:1px solid var(--line); border-radius:10px; font:inherit; height:44px; }
   .row.check { display:flex; gap:10px; align-items:center; } .row.check input { width:22px; height:22px; accent-color: var(--gold); }
+  .row input[type=text] { width:100%; margin-top:6px; padding:10px; background:#101013; color:var(--text); border:1px solid var(--line); border-radius:10px; font:inherit; height:44px; }
+  .hint { color: var(--muted); font-size: 12px; margin: 4px 0 8px; }
+  .presets button.act, .row button.act { flex: 1 1 auto; padding: 10px 12px; font-size: 14px; }
+  .on { background:#2b2410; border-color: var(--gold); color: var(--gold); }
+  .presets { display:flex; gap:8px; flex-wrap:wrap; padding-bottom:12px; } .presets select { flex:1 1 100%; padding:10px; background:#101013; color:var(--text); border:1px solid var(--line); border-radius:10px; font:inherit; height:44px; }
   pre { white-space: pre-wrap; word-break: break-word; font-size: 11px; line-height: 1.35; color: var(--muted); max-height: 280px; overflow:auto; margin: 0 0 12px; }
   footer { color: var(--muted); font-size: 12px; margin-top: 14px; }
 </style>
@@ -49,11 +54,20 @@
   <button id="final" class="primary" hidden>Gerar versão final</button>
 </div>
 <div class="bar">
-  <button id="peek" hidden>Segure para ver o original</button>
+  <button id="compare" hidden>Comparar (arrastar)</button>
+  <button id="peek" hidden>Segure: original</button>
+</div>
+<div class="bar">
+  <button id="tSpot" hidden>Manchas</button>
+  <button id="tDodge" hidden>Clarear</button>
+  <button id="tBurn" hidden>Escurecer</button>
+  <button id="tPush" hidden>Empurrar</button>
+  <button id="undoOp" hidden>Desfazer</button>
 </div>
 <div class="bar">
   <button id="batch" hidden>Processar todas</button>
   <button id="batchSave" hidden class="primary">Salvar todas</button>
+  <button id="batchZip" hidden>Salvar ZIP</button>
 </div>
 
 <div id="controls"></div>
@@ -69,6 +83,8 @@
 
 <script src="lib/face_mesh/face_mesh.js" defer></script>
 <script src="lib/selfie_segmentation/selfie_segmentation.js" defer></script>
+<script src="engine.js" defer></script>
+<script src="meta.js" defer></script>
 <script src="app.js" defer></script>
 </body>
 </html>

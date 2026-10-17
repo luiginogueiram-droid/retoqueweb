@@ -1,6 +1,6 @@
 // Deixa o app funcionar sem internet depois da primeira abertura
-const CACHE = 'retoque-v2';
-const CORE = ['./', 'index.html', 'app.js', 'engine.js', 'worker.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
+const CACHE = 'retoque-v4';
+const CORE = ['./', 'index.html', 'app.js', 'engine.js', 'meta.js', 'worker.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
 const LIBS = [
   'lib/face_mesh/face_mesh.js', 'lib/face_mesh/face_mesh.binarypb', 'lib/face_mesh/face_mesh_solution_packed_assets.data',
   'lib/face_mesh/face_mesh_solution_packed_assets_loader.js', 'lib/face_mesh/face_mesh_solution_simd_wasm_bin.js',
